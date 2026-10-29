@@ -6,8 +6,8 @@ Transcribe en local vídeos de Oracle Cloud Customer Connect (u otro audio/víde
 
 1. **Descarga el audio** de un enlace `.m3u8`/URL con `yt-dlp`, o usa un archivo local. El audio descargado se reutiliza si se vuelve a transcribir el mismo vídeo.
 2. **Transcribe** con faster-whisper (`int8`, CPU, idioma `en`, VAD para saltar silencios).
-3. **Genera un `.md`** en `output/` con:
-   - front matter YAML (`title`, `source`, `event_date`, `language`, `transcribed_on`, `model`, `duration`)
+3. **Genera un `.md`** directamente en la knowledge base (ver [Destino](#destino)) con:
+   - front matter YAML (`title`, `product`, `source`, `event_date`, `language`, `transcribed_on`, `model`, `duration`)
    - una nota para la IA sobre los posibles errores de la transcripción
    - el texto en párrafos de ~60–90 s con marca de tiempo `[HH:MM:SS]`
 
@@ -28,6 +28,7 @@ Doble clic en `ejecutar.bat`. La primera vez crea el entorno virtual e instala l
 | Página de Customer Connect | Enlace de la página del evento; propone el título automáticamente |
 | Título | Revisar acrónimos y apóstrofos |
 | Fecha del evento | `AAAA-MM-DD` (opcional); se usa como prefijo del nombre del archivo |
+| Producto | Subcarpeta de destino (`planning`, `fccs`, `arcs`...); obligatorio |
 | Enlace .m3u8 o archivo | Enlace del stream o archivo local de audio/vídeo |
 | Modelo | `base` (rápido) · `small` (por defecto) · `medium` · `large-v3-turbo` |
 
@@ -36,8 +37,28 @@ Doble clic en `ejecutar.bat`. La primera vez crea el entorno virtual e instala l
 ### Línea de comandos
 
 ```bash
-python transcribe.py "URL_M3U8_O_ARCHIVO" --title "Título" --event-date 2026-10-15 --model small
+python transcribe.py "URL_M3U8_O_ARCHIVO" --title "Título" --product planning --event-date 2026-10-15 --model small
 ```
+
+## Destino
+
+El `.md` se guarda en `epm-knowledge-base\transcripts\<producto>\`, buscando el clon de la knowledge base **junto a `my-tools`**:
+
+```
+C:\IA Projects\
+├── my-tools\whisper-transcription\     ← esta herramienta
+└── epm-knowledge-base\transcripts\     ← aquí se escriben los .md
+    ├── planning\
+    ├── fccs\
+    └── ...
+```
+
+- Si `epm-knowledge-base` no existe en esa ubicación, guarda en `output\<producto>\` (excluido del repo).
+- Para usar otra ruta, define la variable de entorno `EPM_KB_DIR` con la ruta del clon.
+- Para añadir un producto, añádelo a la lista `PRODUCTS` de `transcribe.py`.
+- La interfaz muestra la ruta de destino activa bajo el campo Producto.
+
+Después de transcribir, la subida a GitHub se hace desde el repo `epm-knowledge-base` (`git add`, `commit`, `push`).
 
 ## Archivos
 
@@ -52,7 +73,8 @@ python transcribe.py "URL_M3U8_O_ARCHIVO" --title "Título" --event-date 2026-10
 
 | Ruta | Contenido |
 |---|---|
-| `output/` | Transcripciones `.md` (excluido del repo) |
+| `..\..\epm-knowledge-base\transcripts\<producto>\` | Transcripciones `.md` (destino principal) |
+| `output\<producto>\` | Transcripciones `.md` si no se encuentra la knowledge base (excluido del repo) |
 | `%LOCALAPPDATA%\whisper-transcription\.venv` | Entorno virtual |
 | `%LOCALAPPDATA%\whisper-transcription\audio` | Audio descargado (caché) |
 | `%LOCALAPPDATA%\whisper-transcription\app.log` | Log técnico de la interfaz |

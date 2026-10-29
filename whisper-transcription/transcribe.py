@@ -3,8 +3,11 @@ Motor de transcripción: descarga el audio de un vídeo (.m3u8 o URL) o usa un
 archivo local, lo transcribe en local con faster-whisper (CPU, int8) y genera
 un .md con front matter YAML, una nota para la IA y el texto en párrafos.
 
+El .md se guarda en la knowledge base (epm-knowledge-base/transcripts/<producto>/)
+si su carpeta existe junto a my-tools; si no, en output/<producto>/.
+
 Lo usa la interfaz (app.py). También funciona desde la línea de comandos:
-    python transcribe.py "URL_M3U8_O_ARCHIVO" --title "Título" [--event-date 2026-10-15]
+    python transcribe.py "URL_M3U8_O_ARCHIVO" --title "Título" --product planning [--event-date 2026-10-15]
 """
 from __future__ import annotations
 
@@ -21,7 +24,15 @@ from urllib.parse import urlparse
 # --- Configuración fija ---------------------------------------------------------
 WORK_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "whisper-transcription"
 AUDIO_DIR = WORK_DIR / "audio"                      # fuera de OneDrive
-OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+TOOL_DIR = Path(__file__).resolve().parent          # ...\my-tools\whisper-transcription
+OUTPUT_DIR = TOOL_DIR / "output"                    # destino alternativo si no hay knowledge base
+# Clon local de la knowledge base: por defecto, junto a my-tools (C:\IA Projects\epm-knowledge-base).
+# Se puede cambiar con la variable de entorno EPM_KB_DIR.
+KB_DIR = Path(os.environ.get("EPM_KB_DIR", TOOL_DIR.parent.parent / "epm-knowledge-base"))
+KB_SUBDIR = "transcripts"
+# Subcarpetas de la knowledge base. Para añadir un producto, añádelo a esta lista.
+PRODUCTS = ["planning", "fccs", "arcs", "tax-reporting", "narrative-reporting",
+            "edm", "pcm", "data-integration", "general"]
 SOURCE = "Oracle Cloud Customer Connect"
 LANGUAGE = "en"                                     # todas las transcripciones son en inglés
 MODELS = ["base", "small", "medium", "large-v3-turbo"]
@@ -114,7 +125,19 @@ def safe_filename(title: str, max_len: int = 120) -> str:
     return name[:max_len] or "transcript"
 
 
-def output_path(title: str, event_date: str, out_dir: Path = OUTPUT_DIR) -> Path:
+def output_root() -> Path:
+    """Carpeta raíz de destino: la knowledge base si existe; si no, output/."""
+    return KB_DIR / KB_SUBDIR if KB_DIR.is_dir() else OUTPUT_DIR
+
+
+def output_dir(product: str) -> Path:
+    """Carpeta de destino de un producto, p. ej. ...\\epm-knowledge-base\\transcripts\\planning."""
+    if product not in PRODUCTS:
+        raise ValueError(f"Producto no válido: {product}. Opciones: {', '.join(PRODUCTS)}")
+    return output_root() / product
+
+
+def output_path(title: str, event_date: str, out_dir: Path) -> Path:
     stem = safe_filename(title)
     if event_date:
         stem = f"{event_date}_{stem}"
@@ -130,10 +153,11 @@ def _yaml_str(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def front_matter(title: str, event_date: str, model: str, duration: float) -> str:
+def front_matter(title: str, event_date: str, product: str, model: str, duration: float) -> str:
     return (
         "---\n"
         f"title: {_yaml_str(title)}\n"
+        f"product: {product}\n"
         f"source: {SOURCE}\n"
         f"event_date: {event_date}\n"
         f"language: {LANGUAGE}\n"
@@ -205,13 +229,14 @@ def download_audio(url: str, log: Log = _noop_log, progress: Progress = _noop_pr
 
 
 def write_markdown(segments: Iterable, duration: float, out_md: Path, title: str,
-                   event_date: str, model: str, progress: Progress = _noop_progress) -> int:
+                   event_date: str, product: str, model: str,
+                   progress: Progress = _noop_progress) -> int:
     """Escribe el .md: front matter + nota para la IA + párrafos con marca de tiempo.
     Escribe cada párrafo según se genera, así que si se interrumpe queda lo hecho."""
     out_md.parent.mkdir(parents=True, exist_ok=True)
     paragraphs = 0
     with open(out_md, "w", encoding="utf-8", newline="\n") as f:
-        f.write(front_matter(title, event_date, model, duration))
+        f.write(front_matter(title, event_date, product, model, duration))
         f.write("\n" + AI_NOTE.format(model=model) + "\n\n## Transcript\n\n")
         f.flush()
         buf: list[str] = []
@@ -237,8 +262,9 @@ def write_markdown(segments: Iterable, duration: float, out_md: Path, title: str
     return paragraphs
 
 
-def transcribe_to_md(audio_path: Path, out_md: Path, title: str, event_date: str, model_name: str,
-                     log: Log = _noop_log, progress: Progress = _noop_progress) -> Path:
+def transcribe_to_md(audio_path: Path, out_md: Path, title: str, event_date: str, product: str,
+                     model_name: str, log: Log = _noop_log,
+                     progress: Progress = _noop_progress) -> Path:
     from faster_whisper import BatchedInferencePipeline, WhisperModel
 
     threads = os.cpu_count() or 4
@@ -258,14 +284,16 @@ def transcribe_to_md(audio_path: Path, out_md: Path, title: str, event_date: str
     )
     log(f"Duración del audio: {fmt(info.duration)}")
     t0 = time.time()
-    n = write_markdown(segments, info.duration, out_md, title, event_date, model_name, progress)
+    n = write_markdown(segments, info.duration, out_md, title, event_date, product, model_name, progress)
     log(f"Transcripción terminada en {fmt(time.time() - t0)} ({n} párrafos).")
     return out_md
 
 
-def run(source: str, title: str, event_date: str = "", model_name: str = DEFAULT_MODEL,
-        log: Log = _noop_log, progress: Progress = _noop_progress) -> Path:
+def run(source: str, title: str, product: str, event_date: str = "",
+        model_name: str = DEFAULT_MODEL, log: Log = _noop_log,
+        progress: Progress = _noop_progress) -> Path:
     """Proceso completo. 'source' = enlace .m3u8/URL o ruta a un archivo local."""
+    out_dir = output_dir(product)   # valida el producto antes de descargar nada
     source = source.strip().strip('"')
     if is_url(source):
         audio = download_audio(source, log, progress)
@@ -274,8 +302,8 @@ def run(source: str, title: str, event_date: str = "", model_name: str = DEFAULT
         if not audio.exists():
             raise FileNotFoundError(f"No existe el archivo: {audio}")
         log(f"Usando archivo local: {audio.name}")
-    out_md = output_path(title, event_date)
-    transcribe_to_md(audio, out_md, title, event_date, model_name, log, progress)
+    out_md = output_path(title, event_date, out_dir)
+    transcribe_to_md(audio, out_md, title, event_date, product, model_name, log, progress)
     log(f"Guardado en: {out_md}")
     return out_md
 
@@ -284,10 +312,11 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Transcripción local a .md con faster-whisper")
     p.add_argument("source", help="Enlace .m3u8/URL o ruta a un archivo de audio/vídeo")
     p.add_argument("--title", required=True)
+    p.add_argument("--product", required=True, choices=PRODUCTS, help="Subcarpeta de destino")
     p.add_argument("--event-date", default="", help="AAAA-MM-DD (opcional)")
     p.add_argument("--model", default=DEFAULT_MODEL, choices=MODELS)
     a = p.parse_args()
-    run(a.source, a.title, a.event_date, a.model)
+    run(a.source, a.title, a.product, a.event_date, a.model)
 
 
 if __name__ == "__main__":

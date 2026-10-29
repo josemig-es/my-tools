@@ -53,6 +53,7 @@ class App(tk.Tk):
         self.title_var = tk.StringVar()
         self.date_var = tk.StringVar()
         self.source_var = tk.StringVar()
+        self.product_var = tk.StringVar()
         self.model_var = tk.StringVar(value=engine.DEFAULT_MODEL)
         self.status_var = tk.StringVar(value="Rellena los campos y pulsa Transcribir.")
 
@@ -106,6 +107,20 @@ class App(tk.Tk):
         ttk.Label(df, text="AAAA-MM-DD (opcional)", foreground="gray").pack(side="left", padx=8)
 
         r += 1
+        ttk.Label(f, text="Producto").grid(row=r, column=0, sticky="w", **pad)
+        pf = ttk.Frame(f)
+        pf.grid(row=r, column=1, columnspan=2, sticky="w", **pad)
+        cb = ttk.Combobox(pf, textvariable=self.product_var, values=engine.PRODUCTS,
+                          state="readonly", width=20)
+        cb.pack(side="left")
+        self.inputs.append(cb)
+        ttk.Label(pf, text="Subcarpeta de destino en la knowledge base",
+                  foreground="gray").pack(side="left", padx=8)
+        r += 1
+        ttk.Label(f, text=f"Destino: {engine.output_root()}",
+                  foreground="gray").grid(row=r, column=1, columnspan=2, sticky="w", padx=8)
+
+        r += 1
         ttk.Label(f, text="Enlace .m3u8 o archivo").grid(row=r, column=0, sticky="w", **pad)
         e = self._entry(f, self.source_var)
         e.grid(row=r, column=1, sticky="ew", **pad)
@@ -131,7 +146,7 @@ class App(tk.Tk):
         self.btn_run.pack(side="left")
         self.btn_open = ttk.Button(bf, text="Abrir resultado", command=self._open_result, state="disabled")
         self.btn_open.pack(side="left", padx=8)
-        ttk.Button(bf, text="Abrir carpeta output", command=self._open_folder).pack(side="left")
+        ttk.Button(bf, text="Abrir carpeta destino", command=self._open_folder).pack(side="left")
 
         r += 1
         self.bar = ttk.Progressbar(f, mode="determinate", maximum=100)
@@ -183,12 +198,15 @@ class App(tk.Tk):
         src = self.source_var.get().strip().strip('"')
         title = self.title_var.get().strip()
         dt = self.date_var.get().strip()
+        product = self.product_var.get()
         if not src:
             return self._warn("Pega el enlace .m3u8 o elige un archivo.")
         if not engine.is_url(src) and not Path(src).exists():
             return self._warn("El archivo indicado no existe.")
         if not title:
             return self._warn("Escribe un título (o pega el enlace de la página para rellenarlo).")
+        if not product:
+            return self._warn("Elige el producto (subcarpeta de destino).")
         if dt:
             try:
                 if not DATE_RE.match(dt):
@@ -205,13 +223,14 @@ class App(tk.Tk):
         self.bar.configure(mode="determinate", value=0)
         self.t_start = time.time()
         self._log(f"--- {title} ---")
-        self.worker = threading.Thread(target=self._work, args=(src, title, dt, self.model_var.get()), daemon=True)
+        self.worker = threading.Thread(target=self._work,
+                                       args=(src, title, product, dt, self.model_var.get()), daemon=True)
         self.worker.start()
 
-    def _work(self, src: str, title: str, dt: str, model: str) -> None:
+    def _work(self, src: str, title: str, product: str, dt: str, model: str) -> None:
         """Se ejecuta en segundo plano para que la ventana no se congele."""
         try:
-            path = engine.run(src, title, dt, model,
+            path = engine.run(src, title, product, dt, model,
                               log=lambda m: self.q.put(("log", m)),
                               progress=lambda s, x: self.q.put(("progress", s, x)))
             self.q.put(("done", path))
@@ -289,8 +308,9 @@ class App(tk.Tk):
             os.startfile(self.result)  # abre con el programa asociado a .md
 
     def _open_folder(self) -> None:
-        engine.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        os.startfile(engine.OUTPUT_DIR)
+        folder = engine.output_dir(self.product_var.get()) if self.product_var.get() else engine.output_root()
+        folder.mkdir(parents=True, exist_ok=True)
+        os.startfile(folder)
 
     def _on_close(self) -> None:
         if self.worker and self.worker.is_alive():
