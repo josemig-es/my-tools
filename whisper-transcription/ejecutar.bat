@@ -15,17 +15,24 @@ if not defined PY (
   exit /b 1
 )
 
-rem --- Entorno virtual y dependencias (la primera vez tarda unos minutos) ---
+rem --- Entorno virtual (solo la primera vez) ---
 if not exist "%VENV%\Scripts\python.exe" (
   echo Creando entorno virtual en %VENV%
   %PY% -m venv "%VENV%"
   if errorlevel 1 ( pause & exit /b 1 )
 )
 set "VPY=%VENV%\Scripts\python.exe"
-echo Comprobando dependencias...
-"%VPY%" -m pip install --upgrade pip -q --disable-pip-version-check
-"%VPY%" -m pip install -r requirements.txt -q --disable-pip-version-check
-if errorlevel 1 ( echo [ERROR] Fallo en pip install. & pause & exit /b 1 )
+
+rem --- Dependencias: versiones fijadas con hash en requirements.txt ---
+rem     Solo se instalan la primera vez o si requirements.txt ha cambiado; nunca se actualizan solas.
+set "STAMP=%VENV%\requirements.installed"
+fc /b "requirements.txt" "%STAMP%" >nul 2>nul
+if errorlevel 1 (
+  echo Instalando dependencias fijadas en requirements.txt, tarda unos minutos...
+  "%VPY%" -m pip install --require-hashes --only-binary=:all: -r requirements.txt -q --disable-pip-version-check
+  if errorlevel 1 ( echo [ERROR] Fallo en pip install. & pause & exit /b 1 )
+  copy /y "requirements.txt" "%STAMP%" >nul
+)
 
 "%VPY%" -c "import tkinter" 2>nul
 if errorlevel 1 (

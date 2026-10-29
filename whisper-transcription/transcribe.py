@@ -2,7 +2,6 @@
 Motor de transcripción: descarga el audio de un vídeo (.m3u8 o URL) o usa un
 archivo local, lo transcribe en local con faster-whisper (CPU, int8) y genera
 un .md con front matter YAML (plantilla configurable) y el texto en párrafos.
-La nota para la IA está en un archivo central, AI_NOTE.md, en la raíz del destino.
 
 El .md se guarda en output/<producto>/ o, si existe config.json con 'output_dir',
 en <output_dir>/<producto>/.
@@ -30,8 +29,6 @@ TOOL_DIR = Path(__file__).resolve().parent          # carpeta de la herramienta
 DEFAULT_OUTPUT_DIR = TOOL_DIR / "output"            # destino por defecto
 CONFIG_FILE = TOOL_DIR / "config.json"              # configuración local opcional (no se versiona)
 FRONT_MATTER_FILE = TOOL_DIR / "front_matter.yaml"  # plantilla local opcional (no se versiona)
-AI_NOTE_NAME = "AI_NOTE.md"                         # nota central para la IA, en la raíz del destino
-AI_NOTE_TEMPLATE = TOOL_DIR / "ai_note.example.md"  # texto inicial de AI_NOTE.md
 TRANSCRIPT_HEADING = "## Transcript"                # todo lo que va debajo es el texto transcrito
 # Subcarpetas de destino. Para añadir un producto, añádelo a esta lista.
 PRODUCTS = ["planning", "fccs", "arcs", "tax-reporting", "narrative-reporting",
@@ -211,22 +208,11 @@ def parse_front_matter(text: str) -> dict[str, str]:
     return values
 
 
-def ensure_ai_note(root: Path) -> Path:
-    """Crea AI_NOTE.md en la raíz del destino, copiando ai_note.example.md, si todavía no
-    existe. Nunca lo sobrescribe: a partir de ahí se edita directamente."""
-    path = root / AI_NOTE_NAME
-    if not path.exists() and AI_NOTE_TEMPLATE.is_file():
-        root.mkdir(parents=True, exist_ok=True)
-        path.write_text(AI_NOTE_TEMPLATE.read_text(encoding="utf-8-sig"), encoding="utf-8", newline="\n")
-    return path
-
-
 def update_existing(log: Log = _noop_log) -> tuple[int, int, int]:
     """Reescribe el front matter de todos los .md de las subcarpetas de producto con la
     plantilla actual. No toca nada desde '## Transcript' hacia abajo.
     Devuelve (actualizados, sin cambios, omitidos)."""
     root = output_root()
-    ensure_ai_note(root)
     updated = unchanged = skipped = 0
     for product in PRODUCTS:
         for md in sorted((root / product).glob("*.md")):
@@ -378,7 +364,6 @@ def run(source: str, title: str, product: str, event_date: str = "",
     """Proceso completo. 'source' = enlace .m3u8/URL o ruta a un archivo local.
     'page_url' = enlace de la página del vídeo; se guarda en el campo 'source' del front matter."""
     out_dir = output_dir(product)   # valida el producto antes de descargar nada
-    ensure_ai_note(output_root())
     source = source.strip().strip('"')
     if is_url(source):
         audio = download_audio(source, log, progress)

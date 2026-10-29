@@ -1,12 +1,11 @@
 # my-tools
 
-Herramientas personales. Cada herramienta vive en su propia carpeta con su `README.md`.
+**A collection of small personal tools, built to make studying and day-to-day work easier.**
 
-| Herramienta | Descripción |
-|---|---|
-| [whisper-transcription](whisper-transcription/) | Descarga el audio de un vídeo (`.m3u8` / URL) o usa un archivo local y lo transcribe en local con faster-whisper a un `.md` |
+Each tool lives in its own folder, with its own `README.md` explaining what it does and how to use it.
 
-## Convenciones
+## Tools
 
-- Los resultados que genera cada herramienta (`output/`) no se versionan; ver `.gitignore`.
-- Los entornos virtuales (`.venv`) se crean fuera del repo.
+| Tool | Description | Stack |
+|---|---|---|
+| [**whisper-transcription**](whisper-transcription/) | Transcribes videos or audio recordings locally into Markdown files, ready to discuss with an AI. Works from a `.m3u8` / video link or a local file. | Python · faster-whisper · yt-dlp · tkinter |

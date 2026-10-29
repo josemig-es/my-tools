@@ -16,7 +16,10 @@ on the website, the link will be of one type or another; for example, `.m3u8`) o
 from a local audio/video file. Transcription runs on your machine, on CPU, with
 faster-whisper: the audio is not sent to any external service.
 
-![How whisper-transcription works](docs/flow.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/flow-dark.png">
+  <img alt="How whisper-transcription works" src="docs/flow.png">
+</picture>
 
 ## Contents
 
@@ -105,17 +108,32 @@ duration: 00:59:07
 [00:00:00] Welcome everyone. Today we are going to talk about...
 ```
 
-The note for the AI about possible transcription errors is not repeated in each `.md`: it lives
-in a single central file, `AI_NOTE.md`, at the root of the destination folder
-(see [AI note](#ai-note)).
-
 ## Requirements
 
 | Requirement | Details |
 |---|---|
 | Operating system | Windows |
 | Python | 3.12, 3.13 or 3.14, with `tkinter` (official installer from [python.org](https://www.python.org/)) |
-| Dependencies | `faster-whisper`, `av<19`, `yt-dlp` (`requirements.txt`); installed automatically by `ejecutar.bat` |
+| Dependencies | `faster-whisper`, `av<19`, `yt-dlp`; installed automatically by `ejecutar.bat` |
+
+### Dependency versions
+
+All dependencies, including sub-dependencies, are pinned to exact versions with SHA-256
+hashes in `requirements.txt`:
+
+- `ejecutar.bat` installs them only the first time, or when `requirements.txt` changes.
+  Nothing is updated silently on each launch.
+- `pip` runs with `--require-hashes` and `--only-binary=:all:`: a package whose content does not
+  match its hash is rejected, and no source package is built or executed during installation.
+
+To update the dependencies, edit `requirements.in` (top-level packages) and regenerate the lock
+file with [uv](https://github.com/astral-sh/uv):
+
+```bash
+uv pip compile requirements.in --universal --python-version 3.12 --generate-hashes -o requirements.txt
+```
+
+The next launch of `ejecutar.bat` detects the change and installs the new versions.
 
 ## Usage
 
@@ -188,13 +206,6 @@ To save it somewhere else:
 Lines without a placeholder (e.g. `author: Jane Doe`) are copied as they are.
 `front_matter.yaml` is excluded from the repo.
 
-### AI note
-
-`AI_NOTE.md` is created at the root of the destination folder the first time you transcribe,
-as a copy of `ai_note.example.md` (the general note included in the repo). After that, edit it
-directly in the destination; the tool never overwrites it. Share it together with the `.md`
-files so the AI takes it into account.
-
 ### Update existing `.md` files
 
 The `Actualizar .md existentes` button rewrites the front matter of every `.md` in the product
@@ -214,12 +225,13 @@ whisper-transcription/
 ├── ejecutar.bat                # finds Python, creates the venv, installs dependencies, opens the UI
 ├── app.py                      # tkinter UI; runs the process in the background and shows progress
 ├── transcribe.py               # core logic: download, transcription and .md writing; also a CLI
-├── requirements.txt            # Python dependencies
+├── requirements.in             # top-level dependencies
+├── requirements.txt            # pinned dependencies with hashes (generated from requirements.in)
 ├── config.example.json         # template for config.json (custom destination)
 ├── front_matter.example.yaml   # default front matter template
-├── ai_note.example.md          # general AI note; initial content of AI_NOTE.md
 └── docs/
-    └── flow.png                # flow diagram
+    ├── flow.png                # flow diagram (light theme)
+    └── flow-dark.png           # flow diagram (dark theme)
 ```
 
 **Local files** (created on your machine, not stored in the repo):
@@ -229,7 +241,6 @@ whisper-transcription/
 | `output\<product>\` | `.md` transcripts (default destination) |
 | `config.json` | Custom destination (optional) |
 | `front_matter.yaml` | Custom front matter (optional) |
-| `<destination>\AI_NOTE.md` | Central AI note |
 | `%LOCALAPPDATA%\whisper-transcription\.venv` | Virtual environment |
 | `%LOCALAPPDATA%\whisper-transcription\audio` | Downloaded audio (cache) |
 | `%LOCALAPPDATA%\whisper-transcription\app.log` | Technical log of the interface |
