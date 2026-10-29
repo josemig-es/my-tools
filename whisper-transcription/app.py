@@ -83,7 +83,7 @@ class App(tk.Tk):
         self.inputs: list[tk.Widget] = []
 
         r = 0
-        ttk.Label(f, text="Página de Customer Connect").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Label(f, text="Página del vídeo").grid(row=r, column=0, sticky="w", **pad)
         e = self._entry(f, self.page_url)
         e.grid(row=r, column=1, columnspan=2, sticky="ew", **pad)
         self.inputs.append(e)
@@ -114,10 +114,14 @@ class App(tk.Tk):
                           state="readonly", width=20)
         cb.pack(side="left")
         self.inputs.append(cb)
-        ttk.Label(pf, text="Subcarpeta de destino en la knowledge base",
+        ttk.Label(pf, text="Subcarpeta dentro de la carpeta de destino",
                   foreground="gray").pack(side="left", padx=8)
         r += 1
-        ttk.Label(f, text=f"Destino: {engine.output_root()}",
+        try:
+            dest = f"Destino: {engine.output_root()}"
+        except ValueError as e:   # config.json mal escrito
+            dest = f"Error en config.json: {e}"
+        ttk.Label(f, text=dest,
                   foreground="gray").grid(row=r, column=1, columnspan=2, sticky="w", padx=8)
 
         r += 1
@@ -147,6 +151,9 @@ class App(tk.Tk):
         self.btn_open = ttk.Button(bf, text="Abrir resultado", command=self._open_result, state="disabled")
         self.btn_open.pack(side="left", padx=8)
         ttk.Button(bf, text="Abrir carpeta destino", command=self._open_folder).pack(side="left")
+        b = ttk.Button(bf, text="Actualizar .md existentes", command=self._update_existing)
+        b.pack(side="left", padx=8)
+        self.inputs.append(b)
 
         r += 1
         self.bar = ttk.Progressbar(f, mode="determinate", maximum=100)
@@ -199,6 +206,9 @@ class App(tk.Tk):
         title = self.title_var.get().strip()
         dt = self.date_var.get().strip()
         product = self.product_var.get()
+        page = self.page_url.get().strip()
+        if page and not engine.is_url(page):
+            return self._warn("El enlace de la página debe empezar por http:// o https://.")
         if not src:
             return self._warn("Pega el enlace .m3u8 o elige un archivo.")
         if not engine.is_url(src) and not Path(src).exists():
@@ -224,13 +234,14 @@ class App(tk.Tk):
         self.t_start = time.time()
         self._log(f"--- {title} ---")
         self.worker = threading.Thread(target=self._work,
-                                       args=(src, title, product, dt, self.model_var.get()), daemon=True)
+                                       args=(src, title, product, dt, self.model_var.get(), page),
+                                       daemon=True)
         self.worker.start()
 
-    def _work(self, src: str, title: str, product: str, dt: str, model: str) -> None:
+    def _work(self, src: str, title: str, product: str, dt: str, model: str, page: str) -> None:
         """Se ejecuta en segundo plano para que la ventana no se congele."""
         try:
-            path = engine.run(src, title, product, dt, model,
+            path = engine.run(src, title, product, dt, model, page,
                               log=lambda m: self.q.put(("log", m)),
                               progress=lambda s, x: self.q.put(("progress", s, x)))
             self.q.put(("done", path))
@@ -311,6 +322,26 @@ class App(tk.Tk):
         folder = engine.output_dir(self.product_var.get()) if self.product_var.get() else engine.output_root()
         folder.mkdir(parents=True, exist_ok=True)
         os.startfile(folder)
+
+    def _update_existing(self) -> None:
+        """Aplica la plantilla actual de front matter a todos los .md ya generados."""
+        try:
+            root = engine.output_root()
+        except ValueError as e:
+            return self._warn(str(e))
+        if not messagebox.askyesno(
+                "Transcriptor de vídeos",
+                f"Se reescribirá el front matter de todos los .md de:\n{root}\n\n"
+                "con la plantilla actual. El texto de la transcripción no se modifica.\n\n¿Continuar?"):
+            return
+        try:
+            updated, unchanged, skipped = engine.update_existing(log=self._log)
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            return messagebox.showerror("Transcriptor de vídeos", f"Ha ocurrido un error:\n\n{e}")
+        msg = f"Actualizados: {updated}  ·  sin cambios: {unchanged}  ·  omitidos: {skipped}"
+        self._log(msg)
+        self.status_var.set(msg)
 
     def _on_close(self) -> None:
         if self.worker and self.worker.is_alive():

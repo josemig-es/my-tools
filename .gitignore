@@ -17,6 +17,10 @@ output/
 *.mkv
 *.ogg
 
+# Configuración local de cada herramienta (no se versiona)
+config.json
+front_matter.yaml
+
 # Logs y sistema
 *.log
 Thumbs.db

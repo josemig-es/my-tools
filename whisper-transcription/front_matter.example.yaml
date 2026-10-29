@@ -1,0 +1,10 @@
+---
+title: {title}
+source: {source}
+product: {product}
+event_date: {event_date}
+language: {language}
+transcribed_on: {transcribed_on}
+model: {model}
+duration: {duration}
+---

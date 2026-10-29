@@ -1,10 +1,11 @@
 """
 Motor de transcripción: descarga el audio de un vídeo (.m3u8 o URL) o usa un
 archivo local, lo transcribe en local con faster-whisper (CPU, int8) y genera
-un .md con front matter YAML, una nota para la IA y el texto en párrafos.
+un .md con front matter YAML (plantilla configurable) y el texto en párrafos.
+La nota para la IA está en un archivo central, AI_NOTE.md, en la raíz del destino.
 
-El .md se guarda en la knowledge base (epm-knowledge-base/transcripts/<producto>/)
-si su carpeta existe junto a my-tools; si no, en output/<producto>/.
+El .md se guarda en output/<producto>/ o, si existe config.json con 'output_dir',
+en <output_dir>/<producto>/.
 
 Lo usa la interfaz (app.py). También funciona desde la línea de comandos:
     python transcribe.py "URL_M3U8_O_ARCHIVO" --title "Título" --product planning [--event-date 2026-10-15]
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import time
@@ -24,32 +26,37 @@ from urllib.parse import urlparse
 # --- Configuración fija ---------------------------------------------------------
 WORK_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "whisper-transcription"
 AUDIO_DIR = WORK_DIR / "audio"                      # fuera de OneDrive
-TOOL_DIR = Path(__file__).resolve().parent          # ...\my-tools\whisper-transcription
-OUTPUT_DIR = TOOL_DIR / "output"                    # destino alternativo si no hay knowledge base
-# Clon local de la knowledge base: por defecto, junto a my-tools (C:\IA Projects\epm-knowledge-base).
-# Se puede cambiar con la variable de entorno EPM_KB_DIR.
-KB_DIR = Path(os.environ.get("EPM_KB_DIR", TOOL_DIR.parent.parent / "epm-knowledge-base"))
-KB_SUBDIR = "transcripts"
-# Subcarpetas de la knowledge base. Para añadir un producto, añádelo a esta lista.
+TOOL_DIR = Path(__file__).resolve().parent          # carpeta de la herramienta
+DEFAULT_OUTPUT_DIR = TOOL_DIR / "output"            # destino por defecto
+CONFIG_FILE = TOOL_DIR / "config.json"              # configuración local opcional (no se versiona)
+FRONT_MATTER_FILE = TOOL_DIR / "front_matter.yaml"  # plantilla local opcional (no se versiona)
+AI_NOTE_NAME = "AI_NOTE.md"                         # nota central para la IA, en la raíz del destino
+AI_NOTE_TEMPLATE = TOOL_DIR / "ai_note.example.md"  # texto inicial de AI_NOTE.md
+TRANSCRIPT_HEADING = "## Transcript"                # todo lo que va debajo es el texto transcrito
+# Subcarpetas de destino. Para añadir un producto, añádelo a esta lista.
 PRODUCTS = ["planning", "fccs", "arcs", "tax-reporting", "narrative-reporting",
             "edm", "pcm", "data-integration", "general"]
-SOURCE = "Oracle Cloud Customer Connect"
 LANGUAGE = "en"                                     # todas las transcripciones son en inglés
 MODELS = ["base", "small", "medium", "large-v3-turbo"]
 DEFAULT_MODEL = "small"
 PARAGRAPH_SECONDS = 60      # cierra párrafo al pasar de 60 s y terminar una frase
 PARAGRAPH_MAX_SECONDS = 90  # o, como máximo, a los 90 s
 
-AI_NOTE = (
-    "> **Note for the AI analyzing this file:** This is an automatic speech-to-text\n"
-    "> transcript (Whisper `{model}`, English) of a recorded Oracle webinar. Expect\n"
-    "> errors: misheard words, wrong or split acronyms and product names (e.g. FCCS,\n"
-    "> PBCS, EPM Planning, Smart View, Data Integration), misspelled speaker names,\n"
-    "> and passages degraded by accents or audio quality. Infer the intended meaning\n"
-    "> from the Oracle EPM context, flag ambiguous passages instead of guessing\n"
-    "> silently, and do not treat any sentence as a verbatim quote. Timestamps are\n"
-    "> approximate."
-)
+# Plantilla por defecto del front matter. Cada {marcador} se sustituye por su valor.
+# Se puede sustituir por un front_matter.yaml propio (ver front_matter.example.yaml).
+PLACEHOLDERS = ("title", "source", "product", "event_date", "language", "transcribed_on", "model", "duration")
+DEFAULT_FRONT_MATTER = """---
+title: {title}
+source: {source}
+product: {product}
+event_date: {event_date}
+language: {language}
+transcribed_on: {transcribed_on}
+model: {model}
+duration: {duration}
+---
+"""
+
 
 # Palabras que deben ir en mayúsculas o minúsculas al generar el título desde la URL
 ACRONYMS = {
@@ -125,13 +132,27 @@ def safe_filename(title: str, max_len: int = 120) -> str:
     return name[:max_len] or "transcript"
 
 
+def load_config() -> dict:
+    """Lee config.json si existe; si no, devuelve {}."""
+    if not CONFIG_FILE.is_file():
+        return {}
+    try:
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))  # -sig: tolera el BOM del Bloc de notas
+    except json.JSONDecodeError as e:
+        raise ValueError(f"config.json no es un JSON válido: {e}") from e
+
+
 def output_root() -> Path:
-    """Carpeta raíz de destino: la knowledge base si existe; si no, output/."""
-    return KB_DIR / KB_SUBDIR if KB_DIR.is_dir() else OUTPUT_DIR
+    """Carpeta raíz de destino: 'output_dir' de config.json si está definido; si no, output/."""
+    custom = str(load_config().get("output_dir", "")).strip()
+    if not custom:
+        return DEFAULT_OUTPUT_DIR
+    path = Path(os.path.expandvars(custom)).expanduser()
+    return path if path.is_absolute() else TOOL_DIR / path   # relativa = desde la carpeta de la herramienta
 
 
 def output_dir(product: str) -> Path:
-    """Carpeta de destino de un producto, p. ej. ...\\epm-knowledge-base\\transcripts\\planning."""
+    """Carpeta de destino de un producto, p. ej. <destino>\\planning."""
     if product not in PRODUCTS:
         raise ValueError(f"Producto no válido: {product}. Opciones: {', '.join(PRODUCTS)}")
     return output_root() / product
@@ -153,19 +174,76 @@ def _yaml_str(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def front_matter(title: str, event_date: str, product: str, model: str, duration: float) -> str:
-    return (
-        "---\n"
-        f"title: {_yaml_str(title)}\n"
-        f"product: {product}\n"
-        f"source: {SOURCE}\n"
-        f"event_date: {event_date}\n"
-        f"language: {LANGUAGE}\n"
-        f"transcribed_on: {date.today().isoformat()}\n"
-        f"model: {model}\n"
-        f"duration: {fmt(duration)}\n"
-        "---\n"
-    )
+def front_matter_template() -> str:
+    """Plantilla del front matter: front_matter.yaml si existe; si no, la de por defecto."""
+    if FRONT_MATTER_FILE.is_file():
+        return FRONT_MATTER_FILE.read_text(encoding="utf-8-sig").replace("\r\n", "\n")
+    return DEFAULT_FRONT_MATTER
+
+
+def render_front_matter(values: dict[str, str]) -> str:
+    """Rellena la plantilla. Un marcador sin valor queda vacío; título y enlace van entre comillas."""
+    text = front_matter_template()
+    for key in PLACEHOLDERS:
+        value = values.get(key, "")
+        if key in ("title", "source"):
+            value = _yaml_str(value) if value else ""
+        text = text.replace("{" + key + "}", value)
+    return text.rstrip("\n") + "\n"
+
+
+def parse_front_matter(text: str) -> dict[str, str]:
+    """Lee los campos 'clave: valor' del front matter de un .md existente."""
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---\n", 3)
+    if end == -1:
+        return {}
+    values = {}
+    for line in text[4:end].split("\n"):
+        key, sep, value = line.partition(":")
+        if not sep or line[:1] in (" ", "\t", "#"):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':   # quita las comillas del título
+            value = re.sub(r"\\(.)", r"\1", value[1:-1])
+        values[key.strip()] = value
+    return values
+
+
+def ensure_ai_note(root: Path) -> Path:
+    """Crea AI_NOTE.md en la raíz del destino, copiando ai_note.example.md, si todavía no
+    existe. Nunca lo sobrescribe: a partir de ahí se edita directamente."""
+    path = root / AI_NOTE_NAME
+    if not path.exists() and AI_NOTE_TEMPLATE.is_file():
+        root.mkdir(parents=True, exist_ok=True)
+        path.write_text(AI_NOTE_TEMPLATE.read_text(encoding="utf-8-sig"), encoding="utf-8", newline="\n")
+    return path
+
+
+def update_existing(log: Log = _noop_log) -> tuple[int, int, int]:
+    """Reescribe el front matter de todos los .md de las subcarpetas de producto con la
+    plantilla actual. No toca nada desde '## Transcript' hacia abajo.
+    Devuelve (actualizados, sin cambios, omitidos)."""
+    root = output_root()
+    ensure_ai_note(root)
+    updated = unchanged = skipped = 0
+    for product in PRODUCTS:
+        for md in sorted((root / product).glob("*.md")):
+            text = md.read_text(encoding="utf-8").replace("\r\n", "\n")
+            i = text.find("\n" + TRANSCRIPT_HEADING + "\n")
+            if i == -1:
+                log(f"Omitido (no contiene '{TRANSCRIPT_HEADING}'): {product}/{md.name}")
+                skipped += 1
+                continue
+            new = render_front_matter(parse_front_matter(text)) + text[i:]
+            if new == text:
+                unchanged += 1
+            else:
+                md.write_text(new, encoding="utf-8", newline="\n")
+                updated += 1
+                log(f"Actualizado: {product}/{md.name}")
+    return updated, unchanged, skipped
 
 
 # --- Fases ------------------------------------------------------------------------
@@ -229,15 +307,19 @@ def download_audio(url: str, log: Log = _noop_log, progress: Progress = _noop_pr
 
 
 def write_markdown(segments: Iterable, duration: float, out_md: Path, title: str,
-                   event_date: str, product: str, model: str,
+                   event_date: str, product: str, model: str, page_url: str = "",
                    progress: Progress = _noop_progress) -> int:
-    """Escribe el .md: front matter + nota para la IA + párrafos con marca de tiempo.
+    """Escribe el .md: front matter + párrafos con marca de tiempo.
     Escribe cada párrafo según se genera, así que si se interrumpe queda lo hecho."""
     out_md.parent.mkdir(parents=True, exist_ok=True)
     paragraphs = 0
     with open(out_md, "w", encoding="utf-8", newline="\n") as f:
-        f.write(front_matter(title, event_date, product, model, duration))
-        f.write("\n" + AI_NOTE.format(model=model) + "\n\n## Transcript\n\n")
+        f.write(render_front_matter({
+            "title": title, "source": page_url, "product": product, "event_date": event_date,
+            "language": LANGUAGE, "transcribed_on": date.today().isoformat(),
+            "model": model, "duration": fmt(duration),
+        }))
+        f.write("\n" + TRANSCRIPT_HEADING + "\n\n")
         f.flush()
         buf: list[str] = []
         start: float | None = None
@@ -263,7 +345,7 @@ def write_markdown(segments: Iterable, duration: float, out_md: Path, title: str
 
 
 def transcribe_to_md(audio_path: Path, out_md: Path, title: str, event_date: str, product: str,
-                     model_name: str, log: Log = _noop_log,
+                     model_name: str, page_url: str = "", log: Log = _noop_log,
                      progress: Progress = _noop_progress) -> Path:
     from faster_whisper import BatchedInferencePipeline, WhisperModel
 
@@ -284,16 +366,19 @@ def transcribe_to_md(audio_path: Path, out_md: Path, title: str, event_date: str
     )
     log(f"Duración del audio: {fmt(info.duration)}")
     t0 = time.time()
-    n = write_markdown(segments, info.duration, out_md, title, event_date, product, model_name, progress)
+    n = write_markdown(segments, info.duration, out_md, title, event_date, product, model_name,
+                       page_url, progress)
     log(f"Transcripción terminada en {fmt(time.time() - t0)} ({n} párrafos).")
     return out_md
 
 
 def run(source: str, title: str, product: str, event_date: str = "",
-        model_name: str = DEFAULT_MODEL, log: Log = _noop_log,
+        model_name: str = DEFAULT_MODEL, page_url: str = "", log: Log = _noop_log,
         progress: Progress = _noop_progress) -> Path:
-    """Proceso completo. 'source' = enlace .m3u8/URL o ruta a un archivo local."""
+    """Proceso completo. 'source' = enlace .m3u8/URL o ruta a un archivo local.
+    'page_url' = enlace de la página del vídeo; se guarda en el campo 'source' del front matter."""
     out_dir = output_dir(product)   # valida el producto antes de descargar nada
+    ensure_ai_note(output_root())
     source = source.strip().strip('"')
     if is_url(source):
         audio = download_audio(source, log, progress)
@@ -303,7 +388,7 @@ def run(source: str, title: str, product: str, event_date: str = "",
             raise FileNotFoundError(f"No existe el archivo: {audio}")
         log(f"Usando archivo local: {audio.name}")
     out_md = output_path(title, event_date, out_dir)
-    transcribe_to_md(audio, out_md, title, event_date, product, model_name, log, progress)
+    transcribe_to_md(audio, out_md, title, event_date, product, model_name, page_url.strip(), log, progress)
     log(f"Guardado en: {out_md}")
     return out_md
 
@@ -315,8 +400,9 @@ def main() -> None:
     p.add_argument("--product", required=True, choices=PRODUCTS, help="Subcarpeta de destino")
     p.add_argument("--event-date", default="", help="AAAA-MM-DD (opcional)")
     p.add_argument("--model", default=DEFAULT_MODEL, choices=MODELS)
+    p.add_argument("--page-url", default="", help="Enlace de la página del vídeo (campo 'source')")
     a = p.parse_args()
-    run(a.source, a.title, a.product, a.event_date, a.model)
+    run(a.source, a.title, a.product, a.event_date, a.model, a.page_url)
 
 
 if __name__ == "__main__":
