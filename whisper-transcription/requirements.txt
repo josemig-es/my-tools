@@ -1,0 +1,4 @@
+faster-whisper>=1.0.0
+# av 19 eliminó el parámetro metadata_errors que usa faster-whisper 1.2.1
+av<19
+yt-dlp[default]

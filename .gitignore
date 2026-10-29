@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Resultados de las herramientas (no se versionan)
+output/
+
+# Audio y vídeo
+*.mp3
+*.mp4
+*.m4a
+*.wav
+*.webm
+*.ts
+*.mkv
+*.ogg
+
+# Logs y sistema
+*.log
+Thumbs.db
+desktop.ini
+.DS_Store
