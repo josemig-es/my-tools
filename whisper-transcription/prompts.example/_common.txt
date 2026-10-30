@@ -1,0 +1,5 @@
+# Vocabulary for the Whisper initial_prompt (all products).
+# Lines starting with "# " are comments. "#MISSING" is not a comment (no space after #).
+# Write terms separated by commas, or one per line. Common + product must stay under 223 tokens.
+# Example: replace it with the terms that appear in your own videos.
+Webinar about Example Cloud. Topics: ExampleDB, ExampleQL, REST API, single sign-on.

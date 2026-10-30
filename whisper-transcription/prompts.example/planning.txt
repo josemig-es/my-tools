@@ -1,0 +1,7 @@
+# Vocabulary for the Whisper initial_prompt (product: planning).
+# Lines starting with "# " are comments. "#MISSING" is not a comment (no space after #).
+# Write terms separated by commas, or one per line. Common + product must stay under 223 tokens.
+# Example: one term per line also works.
+Example Planner
+forecast scenarios
+what-if analysis

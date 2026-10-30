@@ -3,10 +3,14 @@ Motor de transcripción: descarga el audio de un vídeo (.m3u8 o URL) o usa un
 archivo local, lo transcribe en local con faster-whisper (CPU, int8) y genera
 un .md con front matter YAML (plantilla configurable) y el texto en párrafos.
 
+Vocabulario opcional (initial_prompt): prompts/_common.txt se aplica a todos los
+productos y prompts/<producto>.txt solo a ese producto. La carpeta no se versiona.
+
 El .md se guarda en output/<producto>/ o, si existe config.json con 'output_dir',
 en <output_dir>/<producto>/.
 
-Lo usa la interfaz (app.py). También funciona desde la línea de comandos:
+Lo usa la interfaz (app.py), también para procesar la cola de trabajos (job_queue.py).
+También funciona desde la línea de comandos:
     python transcribe.py "URL_M3U8_O_ARCHIVO" --title "Título" --product planning [--event-date 2026-10-15]
 """
 from __future__ import annotations
@@ -29,6 +33,9 @@ TOOL_DIR = Path(__file__).resolve().parent          # carpeta de la herramienta
 DEFAULT_OUTPUT_DIR = TOOL_DIR / "output"            # destino por defecto
 CONFIG_FILE = TOOL_DIR / "config.json"              # configuración local opcional (no se versiona)
 FRONT_MATTER_FILE = TOOL_DIR / "front_matter.yaml"  # plantilla local opcional (no se versiona)
+PROMPTS_DIR = TOOL_DIR / "prompts"                  # vocabulario para el initial_prompt (no se versiona)
+COMMON_PROMPT = "_common"                           # prompts/_common.txt se aplica a todos los productos
+PROMPT_MAX_TOKENS = 223                             # límite de Whisper; si se supera, se descarta el principio
 TRANSCRIPT_HEADING = "## Transcript"                # todo lo que va debajo es el texto transcrito
 # Subcarpetas de destino. Para añadir un producto, añádelo a esta lista.
 PRODUCTS = ["planning", "fccs", "arcs", "tax-reporting", "narrative-reporting",
@@ -118,7 +125,8 @@ def audio_key(url: str) -> str:
 
 def find_cached_audio(key: str) -> Path | None:
     for p in sorted(AUDIO_DIR.glob(f"{key}.*")):
-        if p.suffix.lower() not in {".part", ".ytdl", ".tmp"} and p.stat().st_size > 0:
+        name = p.name.lower()   # descarga a medias: .part, .part-Frag3, .ytdl, .temp.mp4...
+        if not any(t in name for t in (".part", ".ytdl", ".tmp", ".temp")) and p.stat().st_size > 0:
             return p
     return None
 
@@ -232,6 +240,78 @@ def update_existing(log: Log = _noop_log) -> tuple[int, int, int]:
     return updated, unchanged, skipped
 
 
+# --- Initial prompt (vocabulario) -------------------------------------------------
+PROMPT_TEMPLATE = """# Vocabulary for the Whisper initial_prompt ({scope}).
+# Lines starting with "# " are comments. "#MISSING" is not a comment (no space after #).
+# Write terms separated by commas, or one per line. Common + product must stay under {limit} tokens.
+"""
+
+
+def prompt_file(name: str) -> Path:
+    """Ruta del archivo de vocabulario: prompts/_common.txt o prompts/<producto>.txt."""
+    return PROMPTS_DIR / f"{name}.txt"
+
+
+def ensure_prompt_file(name: str) -> Path:
+    """Crea el archivo de vocabulario con una cabecera de ayuda si no existe; devuelve su ruta."""
+    path = prompt_file(name)
+    if not path.exists():
+        scope = "all products" if name == COMMON_PROMPT else f"product: {name}"
+        PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(PROMPT_TEMPLATE.format(scope=scope, limit=PROMPT_MAX_TOKENS),
+                        encoding="utf-8", newline="\n")
+    return path
+
+
+def read_prompt_file(path: Path) -> list[str]:
+    """Líneas útiles de un archivo de vocabulario: sin vacías ni comentarios ('# ' al inicio)."""
+    lines = []
+    for line in path.read_text(encoding="utf-8-sig").splitlines():   # -sig: tolera el BOM del Bloc de notas
+        s = line.strip()
+        if s and s != "#" and not s.startswith("# "):
+            lines.append(s)
+    return lines
+
+
+def build_initial_prompt(product: str) -> tuple[str, list[Path]]:
+    """Une el vocabulario común y el del producto (en ese orden) en un único texto.
+    Cada línea se une a la anterior con ', ', o con un espacio si la anterior termina en puntuación.
+    Devuelve (texto, archivos usados). Sin archivos, el texto es ''."""
+    names = [COMMON_PROMPT] + ([product] if product else [])
+    files = [prompt_file(n) for n in names if prompt_file(n).is_file()]
+    text = ""
+    for path in files:
+        for line in read_prompt_file(path):
+            if text:
+                text += " " if text[-1] in ".,;:!?" else ", "
+            text += line
+    return text, files
+
+
+_tokenizer = None
+
+
+def count_prompt_tokens(text: str) -> int | None:
+    """Cuenta los tokens con el tokenizador de Whisper (el mismo en todos los modelos de MODELS).
+    Lo lee de un modelo ya descargado; si aún no hay ninguno, devuelve None."""
+    global _tokenizer
+    if _tokenizer is None:
+        try:
+            from huggingface_hub import try_to_load_from_cache
+            from tokenizers import Tokenizer
+        except ImportError:
+            return None
+        for repo in ("Systran/faster-whisper-small", "Systran/faster-whisper-base",
+                     "Systran/faster-whisper-medium", "mobiuslabsgmbh/faster-whisper-large-v3-turbo"):
+            path = try_to_load_from_cache(repo, "tokenizer.json")
+            if isinstance(path, str):
+                _tokenizer = Tokenizer.from_file(path)
+                break
+        else:
+            return None
+    return len(_tokenizer.encode(text, add_special_tokens=False).ids)
+
+
 # --- Fases ------------------------------------------------------------------------
 class _YdlLogger:
     """Envía a la interfaz solo avisos y errores de yt-dlp."""
@@ -251,8 +331,11 @@ class _YdlLogger:
         self.log(msg)
 
 
-def download_audio(url: str, log: Log = _noop_log, progress: Progress = _noop_progress) -> Path:
-    """Descarga el audio (o reutiliza el ya descargado) en AUDIO_DIR."""
+def download_audio(url: str, log: Log = _noop_log, progress: Progress = _noop_progress,
+                   referer: str = "") -> Path:
+    """Descarga el audio (o reutiliza el ya descargado) en AUDIO_DIR.
+    'referer' = página del vídeo. Algunos reproductores solo sirven el vídeo a peticiones que
+    vienen de su página (cabeceras Referer/Origin); sin ella responden 404 o 403."""
     import yt_dlp
 
     key = audio_key(url)
@@ -282,6 +365,9 @@ def download_audio(url: str, log: Log = _noop_log, progress: Progress = _noop_pr
         "logger": _YdlLogger(log),
         "progress_hooks": [hook],
     }
+    if referer:
+        page = urlparse(referer)
+        opts["http_headers"] = {"Referer": referer, "Origin": f"{page.scheme}://{page.netloc}"}
     log("Descargando audio...")
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -332,7 +418,7 @@ def write_markdown(segments: Iterable, duration: float, out_md: Path, title: str
 
 def transcribe_to_md(audio_path: Path, out_md: Path, title: str, event_date: str, product: str,
                      model_name: str, page_url: str = "", log: Log = _noop_log,
-                     progress: Progress = _noop_progress) -> Path:
+                     progress: Progress = _noop_progress, initial_prompt: str = "") -> Path:
     from faster_whisper import BatchedInferencePipeline, WhisperModel
 
     threads = os.cpu_count() or 4
@@ -340,6 +426,13 @@ def transcribe_to_md(audio_path: Path, out_md: Path, title: str, event_date: str
     progress("model", -1)
     model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=threads)
     batched = BatchedInferencePipeline(model=model)
+
+    if initial_prompt:
+        n_tokens = len(model.hf_tokenizer.encode(initial_prompt, add_special_tokens=False).ids)
+        log(f"Initial prompt: {n_tokens}/{PROMPT_MAX_TOKENS} tokens.")
+        if n_tokens > PROMPT_MAX_TOKENS:
+            log(f"AVISO: el initial prompt supera el límite; Whisper descarta sus "
+                f"{n_tokens - PROMPT_MAX_TOKENS} primeros tokens (el inicio del vocabulario común).")
 
     log("Transcribiendo...")
     progress("transcribe", 0.0)
@@ -349,6 +442,7 @@ def transcribe_to_md(audio_path: Path, out_md: Path, title: str, event_date: str
         beam_size=1,        # greedy decoding: más rápido
         batch_size=8,       # 8 fragmentos de audio en paralelo
         vad_filter=True,    # salta silencios
+        initial_prompt=initial_prompt or None,   # vocabulario; en modo batched se aplica a cada fragmento
     )
     log(f"Duración del audio: {fmt(info.duration)}")
     t0 = time.time()
@@ -360,20 +454,28 @@ def transcribe_to_md(audio_path: Path, out_md: Path, title: str, event_date: str
 
 def run(source: str, title: str, product: str, event_date: str = "",
         model_name: str = DEFAULT_MODEL, page_url: str = "", log: Log = _noop_log,
-        progress: Progress = _noop_progress) -> Path:
+        progress: Progress = _noop_progress, out_md: Path | None = None) -> Path:
     """Proceso completo. 'source' = enlace .m3u8/URL o ruta a un archivo local.
-    'page_url' = enlace de la página del vídeo; se guarda en el campo 'source' del front matter."""
+    'page_url' = enlace de la página del vídeo; se guarda en el campo 'source' del front matter.
+    'out_md' = ruta fija del .md (la usa la cola para repetir un trabajo interrumpido sobre el
+    mismo archivo); si no se indica, se calcula a partir de la fecha y el título."""
     out_dir = output_dir(product)   # valida el producto antes de descargar nada
+    prompt, prompt_used = build_initial_prompt(product)
     source = source.strip().strip('"')
     if is_url(source):
-        audio = download_audio(source, log, progress)
+        audio = download_audio(source, log, progress, referer=page_url.strip())
     else:
         audio = Path(source)
         if not audio.exists():
             raise FileNotFoundError(f"No existe el archivo: {audio}")
         log(f"Usando archivo local: {audio.name}")
-    out_md = output_path(title, event_date, out_dir)
-    transcribe_to_md(audio, out_md, title, event_date, product, model_name, page_url.strip(), log, progress)
+    if prompt_used:
+        log("Vocabulario (initial prompt): " + " + ".join(p.name for p in prompt_used))
+    else:
+        log("Sin vocabulario (initial prompt): no hay archivos en prompts/.")
+    out_md = Path(out_md) if out_md else output_path(title, event_date, out_dir)
+    transcribe_to_md(audio, out_md, title, event_date, product, model_name, page_url.strip(), log, progress,
+                     initial_prompt=prompt)
     log(f"Guardado en: {out_md}")
     return out_md
 

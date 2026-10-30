@@ -16,6 +16,9 @@ on the website, the link will be of one type or another; for example, `.m3u8`) o
 from a local audio/video file. Transcription runs on your machine, on CPU, with
 faster-whisper: the audio is not sent to any external service.
 
+It also includes a [job queue](#job-queue): scripts, other tools or AI agents can add
+videos to a folder, and the interface transcribes them one after another.
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/flow-dark.png">
   <img alt="How whisper-transcription works" src="docs/flow.png">
@@ -26,6 +29,7 @@ faster-whisper: the audio is not sent to any external service.
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
 - [Usage](#usage)
+- [Job queue](#job-queue)
 - [Output destination](#output-destination)
 - [Customization](#customization)
 - [Project structure](#project-structure)
@@ -79,6 +83,12 @@ CPU: it runs on the processor, no graphics card needed. `en`: the audio is assum
 in English. VAD (Voice Activity Detection): silent parts are skipped. These values are
 fixed by default for the best performance; future versions plan to make them
 configurable when needed.
+
+**What is the initial prompt?**  
+A short text passed to Whisper before each audio chunk. Whisper treats it as preceding
+context, so product names, acronyms and jargon written there are more likely to be
+transcribed with the right spelling (e.g. `Hybrid BSO` instead of `HybridBSO`). It is
+optional and built from your own vocabulary files; see [Vocabulary (initial prompt)](#vocabulary-initial-prompt).
 
 </details>
 
@@ -151,8 +161,10 @@ the dependencies (this takes a few minutes).
 | `Título` | Title of the transcript. Check acronyms and apostrophes. |
 | `Fecha del evento` | `YYYY-MM-DD` (optional). Used as the file name prefix. |
 | `Producto` | Destination subfolder (`planning`, `fccs`, `arcs`...). Required. |
+| `Vocabulario` | Opens the common or product vocabulary file and shows the prompt size. See [Vocabulary (initial prompt)](#vocabulary-initial-prompt). |
 | `Enlace .m3u8 o archivo` | Stream link, or a local audio/video file. |
-| `Modelo` | `base` (fastest) · `small` (default) · `medium` · `large-v3-turbo` (most accurate, slowest) |
+| `Modelo` | `base` (fastest) · `small` (default) · `medium` · `large-v3-turbo` (most accurate, slowest). Also used by queued jobs that do not set their own model. |
+| `Cola de trabajos` | Job queue panel. See [Job queue](#job-queue). |
 
 > [!TIP]
 > **How to get the `.m3u8` link:** in Chrome, press `F12` › `Network` › filter by `m3u8` ›
@@ -162,6 +174,142 @@ the dependencies (this takes a few minutes).
 
 ```bash
 python transcribe.py "M3U8_URL_OR_FILE" --title "Title" --product planning --event-date 2026-10-15 --model small --page-url "PAGE_URL"
+```
+
+## Job queue
+
+Besides manual transcriptions, the interface processes a **job queue**: a folder where each
+video to transcribe is a small `.json` file. Anything that can write a file can add jobs: the
+command line, a script, or an AI agent with browser and file access (for example, one that finds
+recordings on a website, reads their title and date, captures the `.m3u8` link and queues them).
+
+### How it works
+
+1. A job is added to `queue\pending\`.
+2. While the window is open, the audio of each pending job is downloaded **right away**, even if
+   another job is being transcribed. Stream links (`.m3u8`) usually expire after a while.
+3. Jobs whose audio is ready are transcribed **one at a time, in order of arrival**. A manual
+   transcription and a queued one never run at the same time: the second one waits.
+4. Finished jobs move to `queue\done\` (with the path of the generated `.md`). Jobs with errors
+   move to `queue\failed\` (with the error message).
+
+> [!NOTE]
+> If the window is closed, jobs simply wait in `pending\` until it is opened again. If it is
+> closed during a queued transcription, that job goes back to `pending\` on the next launch and
+> its `.md` is rewritten from the start.
+
+### Queue panel
+
+| Element | Description |
+|---|---|
+| `Estado` column | `En espera` (waiting) · `Descargando audio` (downloading) · `Audio listo` (audio ready) · `Transcribiendo` (transcribing) · `Error` · `Terminado` (done) |
+| `Pausar cola` / `Reanudar cola` | Pause / resume. While paused, no new queued transcription starts (the current one finishes); audio downloads continue. |
+| `Reintentar` | Moves the selected failed jobs back to pending. |
+| `Quitar` | Removes the selected jobs from the queue. Generated `.md` files are kept. |
+| `Abrir carpeta cola` | Opens the queue folder. |
+| Double-click | On a failed job, shows the error. On a finished job, opens its `.md`. |
+
+> [!TIP]
+> A `403` error usually means the stream link expired before the audio was downloaded. Add the
+> job again with a new link (see below): the failed job is updated and goes back to pending.
+
+### Adding jobs
+
+With `job_queue.py` (standard library only; it also works outside the virtual environment):
+
+```bash
+# One job
+python job_queue.py add --media-url "M3U8_URL" --title "Title" --product planning \
+    --page-url "PAGE_URL" --event-date 2026-10-15
+
+# From a JSON file ("-" reads it from standard input)
+python job_queue.py add --json job.json
+
+# List the queue
+python job_queue.py list
+python job_queue.py list --state failed
+
+# Already queued or transcribed? (exit code 0 = yes, 1 = no)
+python job_queue.py has --page-url "PAGE_URL"
+```
+
+Duplicates are detected by `page_url`:
+
+| The same `page_url` is... | `add` does |
+|---|---|
+| Being transcribed or done | Rejects it (exit code `2`). `--force` adds it anyway. |
+| Pending or failed | Updates that job with the new data (e.g. a new link) and leaves it pending. |
+| Already in a transcript (`source` field of a `.md`) | Nothing: `add` does not check transcripts. Use `has` first. |
+
+### Job format
+
+```json
+{
+  "media_url": "https://example.com/stream/index.m3u8",
+  "title": "Example Webinar Title",
+  "product": "planning",
+  "page_url": "https://example.com/events/example-webinar",
+  "event_date": "2026-10-15",
+  "origin": "example_webinars",
+  "model": "small",
+  "captured_at": "2026-10-30T10:00:00+01:00"
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `media_url` | Yes | `.m3u8` link, video URL supported by `yt-dlp`, or path to a local file |
+| `title` | Yes | Title of the transcript |
+| `product` | Yes | Destination subfolder (one of `PRODUCTS` in `transcribe.py`) |
+| `page_url` | No | Video page link. Fills the `source` field, is used to detect duplicates and is sent as `Referer` when downloading (some players only serve the stream to requests coming from their page). |
+| `event_date` | No | `YYYY-MM-DD` |
+| `origin` | No | Name of a source in `sources.json` (see below) |
+| `model` | No | Whisper model. If empty, the one selected in the interface is used. |
+| `captured_at` | No | When the link was captured (informative) |
+
+The queue adds its own fields (`id`, `added_at`, `output_md`, `error`...). Unknown fields are rejected.
+
+> [!IMPORTANT]
+> To write job files directly instead of using `job_queue.py`, write them under a name that does
+> not end in `.json` and then rename them. This way the interface never reads a half-written file.
+
+### Sources catalog (`sources.json`)
+
+An optional catalog of video sources, meant for whoever searches for videos and fills the queue
+(a person, a script or an AI agent): where to search, how to get the stream link and which videos
+to skip. The transcription itself does not use it; the queue only checks that the `origin` of a
+job exists in it.
+
+1. Copy `sources.example.json` as `sources.json`, in the same folder.
+2. Define one entry per source and set `default`.
+
+| Field | Description |
+|---|---|
+| `default` | Source used when none is specified |
+| `label` | Readable name |
+| `search_url` | Where to search. `{query}` is replaced by the search terms. |
+| `requires_login` | The search must be done in a browser session that is already signed in |
+| `capture` | `m3u8`: capture the stream link while the video plays · `page_url`: the page link works directly with `yt-dlp` |
+| `skip_if_captions` | Skip videos that already have subtitles |
+| `skip_hosts` | Skip videos hosted on these domains |
+| `instructions` | Free-text notes for whoever uses the source |
+
+`sources.json` is excluded from the repo, so each user keeps their own sources.
+
+> [!CAUTION]
+> Only queue content you are allowed to access, and check each website's terms of use before
+> automating access to it or downloading from it.
+
+### Queue location
+
+By default, the queue is the `queue\` folder inside the tool folder (created automatically and
+excluded from the repo). To use another folder, set `queue_dir` in `config.json`:
+
+```json
+{
+  "output_dir": "D:\\Notes\\transcripts",
+  "queue_dir": "D:\\Notes\\transcription-queue"
+}
 ```
 
 ## Output destination
@@ -206,6 +354,39 @@ To save it somewhere else:
 Lines without a placeholder (e.g. `author: Jane Doe`) are copied as they are.
 `front_matter.yaml` is excluded from the repo.
 
+### Vocabulary (initial prompt)
+
+The vocabulary is read from plain text files in the `prompts\` folder:
+
+| File | Applied to |
+|---|---|
+| `prompts\_common.txt` | Every transcription |
+| `prompts\<product>.txt` (e.g. `planning.txt`) | Only transcriptions saved to that product subfolder |
+
+Both are joined (common first, then product) into a single `initial_prompt`. To get started:
+
+1. Copy the `prompts.example` folder as `prompts`, in the same folder, and replace the example terms.
+2. Or use the `Editar común` / `Editar producto` buttons in the interface: they open the file
+   (creating it if it does not exist) for the selected product.
+
+Format:
+
+- Write terms separated by commas, as sentences, or one per line. Lines are joined with `, `
+  (or a space, if the previous line ends with punctuation).
+- Lines starting with `# ` are comments. `#MISSING` is not a comment (no space after `#`).
+- A product without its own file uses only `_common.txt`. Without any file, no prompt is used.
+
+> [!IMPORTANT]
+> Whisper accepts up to **223 tokens** of prompt (roughly 600–800 characters of technical
+> terms). If common + product exceed it, Whisper discards the **beginning** of the text.
+> The interface shows the current size next to the buttons (`N/223 tokens`, once a model has
+> been downloaded) and the log reports it at the start of each transcription.
+
+- In batched mode the prompt is applied to every audio chunk, not only to the first 30 seconds.
+- Prefer real terms that appear in the videos: unrelated text in the prompt can bias the transcript.
+- `prompts\` is excluded from the repo, so each user keeps their own vocabulary. Changes apply
+  to new transcriptions only.
+
 ### Update existing `.md` files
 
 The `Actualizar .md existentes` button rewrites the front matter of every `.md` in the product
@@ -225,10 +406,15 @@ whisper-transcription/
 ├── ejecutar.bat                # finds Python, creates the venv, installs dependencies, opens the UI
 ├── app.py                      # tkinter UI; runs the process in the background and shows progress
 ├── transcribe.py               # core logic: download, transcription and .md writing; also a CLI
+├── job_queue.py                # job queue: add, list and check jobs; also a CLI
 ├── requirements.in             # top-level dependencies
 ├── requirements.txt            # pinned dependencies with hashes (generated from requirements.in)
 ├── config.example.json         # template for config.json (custom destination)
+├── sources.example.json        # template for sources.json (sources catalog)
 ├── front_matter.example.yaml   # default front matter template
+├── prompts.example/            # example vocabulary for the initial prompt
+│   ├── _common.txt             # applied to every product
+│   └── planning.txt            # applied only to the "planning" product
 └── docs/
     ├── flow.png                # flow diagram (light theme)
     └── flow-dark.png           # flow diagram (dark theme)
@@ -239,8 +425,11 @@ whisper-transcription/
 | Path | Content |
 |---|---|
 | `output\<product>\` | `.md` transcripts (default destination) |
-| `config.json` | Custom destination (optional) |
+| `config.json` | Custom destination and queue folder (optional) |
 | `front_matter.yaml` | Custom front matter (optional) |
+| `prompts\` | Vocabulary for the initial prompt (optional) |
+| `sources.json` | Sources catalog (optional) |
+| `queue\` | Job queue: `pending\`, `processing\`, `done\`, `failed\` |
 | `%LOCALAPPDATA%\whisper-transcription\.venv` | Virtual environment |
 | `%LOCALAPPDATA%\whisper-transcription\audio` | Downloaded audio (cache) |
 | `%LOCALAPPDATA%\whisper-transcription\app.log` | Technical log of the interface |

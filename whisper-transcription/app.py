@@ -1,6 +1,11 @@
 """
 Interfaz para transcribir vídeos a .md. Se abre con ejecutar.bat.
 La lógica de descarga y transcripción está en transcribe.py.
+
+Mientras está abierta, procesa también la cola de trabajos (job_queue.py):
+- un hilo descarga el audio de cada trabajo pendiente en cuanto aparece (los enlaces .m3u8 caducan);
+- otro hilo transcribe los trabajos con el audio listo, de uno en uno y por orden de llegada.
+Una transcripción manual y una de la cola nunca se ejecutan a la vez (engine_lock).
 """
 from __future__ import annotations
 
@@ -11,7 +16,7 @@ import sys
 import threading
 import time
 import traceback
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 WORK_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "whisper-transcription"
@@ -28,9 +33,12 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+import job_queue as jq
 import transcribe as engine
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+DONE_SHOWN = 20             # trabajos terminados que se muestran en la lista
+QUEUE_REFRESH_MS = 3000     # cada cuánto se relee la carpeta de la cola
 STAGES = {"download": "Descargando audio", "model": "Cargando modelo", "transcribe": "Transcribiendo"}
 MEDIA_TYPES = [("Audio o vídeo", "*.mp4 *.m4a *.mp3 *.wav *.webm *.ts *.mkv *.ogg"), ("Todos", "*.*")]
 
@@ -39,7 +47,7 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Transcriptor de vídeos")
-        self.minsize(760, 560)
+        self.minsize(760, 760)
 
         self.q: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -56,11 +64,37 @@ class App(tk.Tk):
         self.product_var = tk.StringVar()
         self.model_var = tk.StringVar(value=engine.DEFAULT_MODEL)
         self.status_var = tk.StringVar(value="Rellena los campos y pulsa Transcribir.")
+        self.prompt_var = tk.StringVar()
+
+        # --- Cola de trabajos ---
+        self.engine_lock = threading.Lock()      # una sola transcripción a la vez (manual o de la cola)
+        self.queue_lock = threading.Lock()       # movimientos de archivos de la cola
+        self.queue_paused = threading.Event()    # activado = no se empiezan transcripciones de la cola
+        self.downloading: set[str] = set()       # audios que se están descargando (audio_key)
+        self.active = ""                         # qué usa la barra de progreso: "", "manual" o "cola"
+        self.active_title = ""
+        self._model = engine.DEFAULT_MODEL       # copia del modelo elegido, legible desde los hilos
+        self._queue_rows: list = []
+        self.queue_btn_var = tk.StringVar(value="Pausar cola")
+        self.queue_info_var = tk.StringVar()
+        try:
+            self.qroot: Path | None = jq.queue_root()
+            jq.ensure_dirs(self.qroot)
+            self.queue_error = ""
+        except (ValueError, OSError) as e:   # config.json mal escrito o carpeta inaccesible
+            self.qroot = None
+            self.queue_error = str(e)
 
         self._build()
+        self.model_var.trace_add("write", lambda *_: setattr(self, "_model", self.model_var.get()))
         self.page_url.trace_add("write", self._on_page_url)
+        self.product_var.trace_add("write", lambda *_: self._refresh_prompt())
+        # Al volver a la ventana (p. ej. tras editar el vocabulario en el Bloc de notas) se recalcula
+        self.bind("<FocusIn>", lambda ev: self._refresh_prompt())
+        self._refresh_prompt()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(200, self._poll)
+        self._start_queue()
 
     # --- Construcción de la ventana ------------------------------------------------
     def _entry(self, parent: tk.Misc, var: tk.StringVar, width: int = 60) -> ttk.Entry:
@@ -125,6 +159,18 @@ class App(tk.Tk):
                   foreground="gray").grid(row=r, column=1, columnspan=2, sticky="w", padx=8)
 
         r += 1
+        ttk.Label(f, text="Vocabulario").grid(row=r, column=0, sticky="w", **pad)
+        vf = ttk.Frame(f)
+        vf.grid(row=r, column=1, columnspan=2, sticky="w", **pad)
+        b = ttk.Button(vf, text="Editar común", command=lambda: self._edit_prompt(engine.COMMON_PROMPT))
+        b.pack(side="left")
+        self.inputs.append(b)
+        b = ttk.Button(vf, text="Editar producto", command=lambda: self._edit_prompt(self.product_var.get()))
+        b.pack(side="left", padx=8)
+        self.inputs.append(b)
+        ttk.Label(vf, textvariable=self.prompt_var, foreground="gray").pack(side="left")
+
+        r += 1
         ttk.Label(f, text="Enlace .m3u8 o archivo").grid(row=r, column=0, sticky="w", **pad)
         e = self._entry(f, self.source_var)
         e.grid(row=r, column=1, sticky="ew", **pad)
@@ -156,7 +202,31 @@ class App(tk.Tk):
         self.inputs.append(b)
 
         r += 1
-        self.bar = ttk.Progressbar(f, mode="determinate", maximum=100)
+        qf = ttk.LabelFrame(f, text="Cola de trabajos", padding=8)
+        qf.grid(row=r, column=0, columnspan=3, sticky="ew", padx=8, pady=(8, 4))
+        qf.columnconfigure(0, weight=1)
+        cols = (("estado", "Estado", 140, False), ("fecha", "Fecha", 90, False),
+                ("producto", "Producto", 110, False), ("titulo", "Título", 320, True))
+        self.tree = ttk.Treeview(qf, columns=[c[0] for c in cols], show="headings", height=6,
+                                 selectmode="extended")
+        for key, text, width, stretch in cols:
+            self.tree.heading(key, text=text, anchor="w")
+            self.tree.column(key, width=width, stretch=stretch, anchor="w")
+        self.tree.grid(row=0, column=0, sticky="ew")
+        tsb = ttk.Scrollbar(qf, command=self.tree.yview)
+        self.tree["yscrollcommand"] = tsb.set
+        tsb.grid(row=0, column=1, sticky="ns")
+        self.tree.bind("<Double-1>", self._on_tree_double)
+        qb = ttk.Frame(qf)
+        qb.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(qb, textvariable=self.queue_btn_var, command=self._toggle_queue).pack(side="left")
+        ttk.Button(qb, text="Reintentar", command=self._retry_selected).pack(side="left", padx=8)
+        ttk.Button(qb, text="Quitar", command=self._remove_selected).pack(side="left")
+        ttk.Button(qb, text="Abrir carpeta cola", command=self._open_queue_folder).pack(side="left", padx=8)
+        ttk.Label(qb, textvariable=self.queue_info_var, foreground="gray").pack(side="left")
+
+        r += 1
+        self.bar =ttk.Progressbar(f, mode="determinate", maximum=100)
         self.bar.grid(row=r, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 2))
         r += 1
         ttk.Label(f, textvariable=self.status_var).grid(row=r, column=0, columnspan=3, sticky="w", padx=8)
@@ -180,6 +250,30 @@ class App(tk.Tk):
         if proposal and (not current or current == self._autotitle):
             self.title_var.set(proposal)
             self._autotitle = proposal
+
+    def _refresh_prompt(self) -> None:
+        """Muestra qué archivos de vocabulario se usarán con el producto elegido y su tamaño."""
+        try:
+            text, files = engine.build_initial_prompt(self.product_var.get())
+            n = engine.count_prompt_tokens(text) if text else 0
+        except Exception as e:  # noqa: BLE001
+            return self.prompt_var.set(f"Error al leer prompts/: {e}")
+        if not files:
+            return self.prompt_var.set("Sin vocabulario (initial prompt)")
+        names = " + ".join(p.name for p in files)
+        if n is None:   # aún no hay ningún modelo descargado para contar tokens
+            size = f"{len(text)} caracteres"
+        elif n > engine.PROMPT_MAX_TOKENS:
+            size = f"{n}/{engine.PROMPT_MAX_TOKENS} tokens · SUPERA EL LÍMITE: se perderá el inicio"
+        else:
+            size = f"{n}/{engine.PROMPT_MAX_TOKENS} tokens"
+        self.prompt_var.set(f"{names} · {size}")
+
+    def _edit_prompt(self, name: str) -> None:
+        """Abre (y crea si no existe) el archivo de vocabulario común o el del producto."""
+        if not name:
+            return self._warn("Elige primero el producto.")
+        os.startfile(engine.ensure_prompt_file(name))  # abre con el programa asociado a .txt
 
     def _pick_file(self) -> None:
         path = filedialog.askopenfilename(title="Elige un archivo de audio o vídeo", filetypes=MEDIA_TYPES)
@@ -228,11 +322,10 @@ class App(tk.Tk):
         self._set_inputs(False)
         self.btn_open["state"] = "disabled"
         self.result = None
-        self.stage, self.frac = "", 0.0
-        self.bar.stop()
-        self.bar.configure(mode="determinate", value=0)
         self.t_start = time.time()
         self._log(f"--- {title} ---")
+        if self.engine_lock.locked():
+            self.status_var.set("Esperando a que termine la transcripción de la cola...")
         self.worker = threading.Thread(target=self._work,
                                        args=(src, title, product, dt, self.model_var.get(), page),
                                        daemon=True)
@@ -240,7 +333,11 @@ class App(tk.Tk):
 
     def _work(self, src: str, title: str, product: str, dt: str, model: str, page: str) -> None:
         """Se ejecuta en segundo plano para que la ventana no se congele."""
+        if not self.engine_lock.acquire(blocking=False):
+            self.q.put(("log", "Esperando a que termine la transcripción de la cola..."))
+            self.engine_lock.acquire()
         try:
+            self.q.put(("active", "manual", title))
             path = engine.run(src, title, product, dt, model, page,
                               log=lambda m: self.q.put(("log", m)),
                               progress=lambda s, x: self.q.put(("progress", s, x)))
@@ -248,6 +345,8 @@ class App(tk.Tk):
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
             self.q.put(("error", e))
+        finally:
+            self.engine_lock.release()
 
     def _poll(self) -> None:
         """Recoge los mensajes del proceso en segundo plano y actualiza la ventana."""
@@ -258,15 +357,34 @@ class App(tk.Tk):
                     self._log(item[1])
                 elif item[0] == "progress":
                     self._set_progress(item[1], item[2])
+                elif item[0] == "active":
+                    self._set_active(item[1], item[2])
                 elif item[0] == "done":
                     self._finish(item[1])
                 elif item[0] == "error":
                     self._fail(item[1])
+                elif item[0] == "qdone":
+                    self._queue_finished(item[1], item[2])
+                elif item[0] == "qerror":
+                    self._queue_failed(item[1])
+                elif item[0] == "qrefresh":
+                    self._refresh_queue()
         except queue.Empty:
             pass
-        if self.worker and self.worker.is_alive():
+        if self.active:
             self._update_status()
         self.after(200, self._poll)
+
+    def _set_active(self, kind: str, title: str) -> None:
+        """Empieza una transcripción (manual o de la cola): reinicia la barra y el cronómetro."""
+        self.active, self.active_title = kind, title
+        self.t_start = time.time()
+        self.stage, self.frac = "", 0.0
+        self.bar.stop()
+        self.bar.configure(mode="determinate", value=0)
+        if kind == "cola":
+            self._log(f"--- [Cola] {title} ---")
+            self._refresh_queue()
 
     def _set_progress(self, stage: str, frac: float) -> None:
         self.stage = stage
@@ -284,9 +402,14 @@ class App(tk.Tk):
     def _update_status(self) -> None:
         label = STAGES.get(self.stage, "Preparando")
         pct = f" {self.frac * 100:.0f} %" if self.frac >= 0 and self.stage != "model" else ""
-        self.status_var.set(f"{label}...{pct}  ·  {engine.fmt(time.time() - self.t_start)} transcurrido")
+        prefix = ""
+        if self.active == "cola":
+            t = self.active_title
+            prefix = f"[Cola] {t[:57] + '...' if len(t) > 60 else t}  ·  "
+        self.status_var.set(f"{prefix}{label}...{pct}  ·  {engine.fmt(time.time() - self.t_start)} transcurrido")
 
     def _finish(self, path: Path) -> None:
+        self.active = ""
         self.bar.stop()
         self.bar.configure(mode="determinate", value=100)
         self.result = path
@@ -296,6 +419,7 @@ class App(tk.Tk):
         self.bell()
 
     def _fail(self, err: Exception) -> None:
+        self.active = ""
         self.bar.stop()
         self.bar.configure(mode="determinate", value=0)
         self._set_inputs(True)
@@ -344,13 +468,280 @@ class App(tk.Tk):
         self.status_var.set(msg)
 
     def _on_close(self) -> None:
-        if self.worker and self.worker.is_alive():
+        if self.engine_lock.locked() or (self.worker and self.worker.is_alive()):
             if not messagebox.askyesno("Transcriptor de vídeos",
                                        "Hay una transcripción en curso. Si cierras, se detiene y el .md "
-                                       "quedará incompleto.\n\n¿Cerrar de todos modos?"):
+                                       "quedará incompleto.\n\nSi es de la cola, se repetirá desde el "
+                                       "principio la próxima vez que abras la ventana.\n\n"
+                                       "¿Cerrar de todos modos?"):
                 return
         self.destroy()
         os._exit(0)  # termina también el proceso en segundo plano
+
+    # --- Cola de trabajos -----------------------------------------------------------
+    def _qlog(self, msg: str) -> None:
+        """Log de los hilos de la cola (se muestra desde el hilo de la ventana)."""
+        self.q.put(("log", f"[Cola] {msg}"))
+
+    @staticmethod
+    def _job_key(job: dict) -> str:
+        src = job.get("media_url", "").strip().strip('"')
+        return engine.audio_key(src) if engine.is_url(src) else ""
+
+    def _audio_ready(self, job: dict) -> bool:
+        """True si el audio del trabajo ya está en disco (en la caché o como archivo local)."""
+        src = job.get("media_url", "").strip().strip('"')
+        if not engine.is_url(src):
+            return Path(src).exists()
+        key = engine.audio_key(src)
+        return key not in self.downloading and engine.find_cached_audio(key) is not None
+
+    def _start_queue(self) -> None:
+        if self.qroot is None:
+            self.queue_info_var.set(f"Cola desactivada: {self.queue_error}")
+            return
+        with self.queue_lock:
+            recovered = jq.recover(self.qroot)
+        if recovered:
+            self._log(f"[Cola] {len(recovered)} trabajo(s) interrumpido(s) vuelven a pendientes.")
+        threading.Thread(target=self._download_loop, daemon=True).start()
+        threading.Thread(target=self._transcribe_loop, daemon=True).start()
+        self._refresh_queue()
+        self.after(QUEUE_REFRESH_MS, self._auto_refresh)
+
+    def _auto_refresh(self) -> None:
+        self._refresh_queue()
+        self.after(QUEUE_REFRESH_MS, self._auto_refresh)
+
+    def _queue_fail(self, path: Path, err: object) -> None:
+        """Pasa un trabajo a failed/ con el mensaje de error. Se llama desde los hilos."""
+        text = re.sub(r"^(ERROR:\s*)+", "", str(err))
+        if "403" in text or "Forbidden" in text:
+            text = "Enlace caducado o no válido (403): hace falta un enlace nuevo. " + text
+        with self.queue_lock:
+            if path.exists():
+                jq.move(path, "failed", {"error": text[:1000],
+                                         "failed_at": datetime.now().isoformat(timespec="seconds")},
+                        self.qroot)
+        self._qlog(f"ERROR: {text[:300]}")
+        self.q.put(("qrefresh",))
+
+    def _download_loop(self) -> None:
+        """Descarga el audio de cada trabajo pendiente en cuanto aparece, porque los enlaces .m3u8
+        caducan. Sigue funcionando con la cola en pausa."""
+        while True:
+            try:
+                for path, job in jq.list_jobs("pending", self.qroot):
+                    src = job.get("media_url", "").strip().strip('"')
+                    if not engine.is_url(src) or self._audio_ready(job):
+                        continue
+                    key = engine.audio_key(src)
+                    self.downloading.add(key)
+                    self.q.put(("qrefresh",))
+                    self._qlog(f"Audio de: {job.get('title', path.name)}")
+                    try:
+                        engine.download_audio(src, log=self._qlog, referer=job.get("page_url", ""))
+                    except Exception as e:  # noqa: BLE001
+                        traceback.print_exc()
+                        self._queue_fail(path, e)
+                    finally:
+                        self.downloading.discard(key)
+                        self.q.put(("qrefresh",))
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+            time.sleep(5)
+
+    def _claim_next(self) -> tuple[Path, dict] | None:
+        """Pasa a processing/ el primer trabajo pendiente con el audio listo y fija la ruta de su .md."""
+        with self.queue_lock:
+            for path, job in jq.list_jobs("pending", self.qroot):
+                src = job.get("media_url", "").strip().strip('"')
+                if not engine.is_url(src) and not Path(src).exists():
+                    self._queue_fail_locked(path, f"No existe el archivo: {src}")
+                    continue
+                if not self._audio_ready(job):
+                    continue
+                try:
+                    out_md = job.get("output_md") or str(engine.output_path(
+                        job["title"], job.get("event_date", ""), engine.output_dir(job["product"])))
+                except (KeyError, ValueError) as e:   # trabajo mal formado escrito a mano
+                    self._queue_fail_locked(path, f"Trabajo no válido: {e}")
+                    continue
+                new = jq.move(path, "processing", {
+                    "output_md": out_md, "started_at": datetime.now().isoformat(timespec="seconds")},
+                    self.qroot)
+                return new, jq.read_job(new)
+        return None
+
+    def _queue_fail_locked(self, path: Path, msg: str) -> None:
+        """Como _queue_fail, pero con queue_lock ya adquirido."""
+        jq.move(path, "failed", {"error": msg, "failed_at": datetime.now().isoformat(timespec="seconds")},
+                self.qroot)
+        self._qlog(f"ERROR: {msg}")
+        self.q.put(("qrefresh",))
+
+    def _transcribe_loop(self) -> None:
+        """Transcribe los trabajos con el audio listo, de uno en uno y por orden de llegada."""
+        while True:
+            time.sleep(3)
+            if self.queue_paused.is_set():
+                continue
+            if not self.engine_lock.acquire(blocking=False):   # hay una transcripción manual en curso
+                continue
+            claimed = None
+            try:
+                claimed = self._claim_next()
+                if not claimed:
+                    continue
+                path, job = claimed
+                title = job.get("title", path.stem)
+                self.q.put(("active", "cola", title))
+                md = engine.run(job["media_url"], title, job["product"], job.get("event_date", ""),
+                                job.get("model") or self._model, job.get("page_url", ""),
+                                log=self._qlog, progress=lambda s, x: self.q.put(("progress", s, x)),
+                                out_md=Path(job["output_md"]))
+                with self.queue_lock:
+                    jq.move(path, "done", {"output_md": str(md),
+                                           "finished_at": datetime.now().isoformat(timespec="seconds")},
+                            self.qroot)
+                self.q.put(("qdone", title, md))
+            except Exception as e:  # noqa: BLE001
+                traceback.print_exc()
+                if claimed:
+                    self._queue_fail(claimed[0], e)
+                    self.q.put(("qerror", claimed[1].get("title", claimed[0].stem)))
+            finally:
+                self.engine_lock.release()
+
+    def _queue_finished(self, title: str, path: Path) -> None:
+        self.active = ""
+        self.bar.stop()
+        self.bar.configure(mode="determinate", value=100)
+        self.result = path
+        if str(self.btn_run["state"]) == "normal":   # no hay una manual esperando
+            self.btn_open["state"] = "normal"
+        self.status_var.set(f"[Cola] Terminado en {engine.fmt(time.time() - self.t_start)}  ·  {path.name}")
+        self._refresh_queue()
+
+    def _queue_failed(self, title: str) -> None:
+        self.active = ""
+        self.bar.stop()
+        self.bar.configure(mode="determinate", value=0)
+        self.status_var.set(f"[Cola] Error en: {title}. Doble clic en el trabajo para ver el detalle.")
+        self._refresh_queue()
+
+    def _refresh_queue(self) -> None:
+        """Relee la carpeta de la cola y actualiza la lista (solo si algo ha cambiado)."""
+        if self.qroot is None:
+            return
+        rows, counts = [], {}
+        names = {"processing": "Transcribiendo", "failed": "Error", "done": "Terminado"}
+        for state in ("processing", "pending", "failed", "done"):
+            jobs = jq.list_jobs(state, self.qroot)
+            counts[state] = len(jobs)
+            if state == "done":
+                jobs = jobs[-DONE_SHOWN:][::-1]   # los últimos, el más reciente arriba
+            for path, job in jobs:
+                if state == "pending":
+                    if self._job_key(job) in self.downloading:
+                        label = "Descargando audio"
+                    elif self._audio_ready(job):
+                        label = "Audio listo"
+                    else:
+                        label = "En espera"
+                else:
+                    label = names[state]
+                rows.append((f"{state}/{path.name}",
+                             (label, job.get("event_date", ""), job.get("product", ""),
+                              job.get("title", path.stem))))
+        paused = "  ·  EN PAUSA (las descargas continúan)" if self.queue_paused.is_set() else ""
+        self.queue_info_var.set(f"Pendientes: {counts['pending']}  ·  errores: {counts['failed']}  ·  "
+                                f"terminados: {counts['done']}{paused}")
+        if rows == self._queue_rows:
+            return
+        self._queue_rows = rows
+        selected = self.tree.selection()
+        self.tree.delete(*self.tree.get_children())
+        for iid, values in rows:
+            self.tree.insert("", "end", iid=iid, values=values)
+        keep = [i for i in selected if self.tree.exists(i)]
+        if keep:
+            self.tree.selection_set(keep)
+
+    def _selected_jobs(self, allowed: tuple[str, ...]) -> list[Path]:
+        paths = []
+        for iid in self.tree.selection():
+            state, _, name = iid.partition("/")
+            if state in allowed:
+                paths.append(self.qroot / state / name)
+        return paths
+
+    def _toggle_queue(self) -> None:
+        if self.queue_paused.is_set():
+            self.queue_paused.clear()
+            self.queue_btn_var.set("Pausar cola")
+            self._log("[Cola] Reanudada.")
+        else:
+            self.queue_paused.set()
+            self.queue_btn_var.set("Reanudar cola")
+            self._log("[Cola] En pausa: la transcripción en curso termina; no empieza ninguna nueva. "
+                      "Las descargas de audio continúan.")
+        self._refresh_queue()
+
+    def _retry_selected(self) -> None:
+        if self.qroot is None:
+            return
+        paths = self._selected_jobs(("failed",))
+        if not paths:
+            return self._warn("Selecciona uno o más trabajos con estado Error.")
+        with self.queue_lock:
+            for p in paths:
+                if p.exists():
+                    jq.move(p, "pending", {"error": None, "failed_at": None,
+                                           "requeued_at": datetime.now().isoformat(timespec="seconds")},
+                            self.qroot)
+        self._log(f"[Cola] {len(paths)} trabajo(s) vuelven a pendientes. Si el error era de enlace "
+                  "caducado (403) y el audio no llegó a descargarse, hace falta un enlace nuevo.")
+        self._refresh_queue()
+
+    def _remove_selected(self) -> None:
+        if self.qroot is None:
+            return
+        paths = self._selected_jobs(("pending", "failed", "done"))
+        if not paths:
+            return self._warn("Selecciona uno o más trabajos pendientes, con error o terminados.\n"
+                              "El trabajo que se está transcribiendo no se puede quitar.")
+        if not messagebox.askyesno("Transcriptor de vídeos",
+                                   f"Se quitarán {len(paths)} trabajo(s) de la cola.\n\n"
+                                   "Los .md ya generados no se borran.\n\n¿Continuar?"):
+            return
+        with self.queue_lock:
+            for p in paths:
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
+        self._refresh_queue()
+
+    def _open_queue_folder(self) -> None:
+        if self.qroot is None:
+            return self._warn(f"Cola desactivada: {self.queue_error}")
+        os.startfile(self.qroot)
+
+    def _on_tree_double(self, event: tk.Event) -> None:
+        """Doble clic: un trabajo con error muestra el mensaje; uno terminado abre su .md."""
+        iid = self.tree.identify_row(event.y)
+        if not iid or self.qroot is None:
+            return
+        state, _, name = iid.partition("/")
+        try:
+            job = jq.read_job(self.qroot / state / name)
+        except (OSError, ValueError):
+            return
+        if state == "failed":
+            messagebox.showerror("Transcriptor de vídeos", f"{job.get('title', name)}\n\n{job.get('error', '')}")
+        elif state == "done" and job.get("output_md") and Path(job["output_md"]).exists():
+            os.startfile(job["output_md"])
 
 
 def main() -> None:

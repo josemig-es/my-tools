@@ -1,0 +1,23 @@
+{
+  "default": "example_webinars",
+  "sources": {
+    "example_webinars": {
+      "label": "Example webinar portal",
+      "search_url": "https://webinars.example.com/events?status=past&q={query}",
+      "requires_login": true,
+      "capture": "m3u8",
+      "skip_if_captions": true,
+      "skip_hosts": ["youtube.com", "youtu.be"],
+      "instructions": "Past events with a recording only. Read the title and event date from the event page. Play the video and capture the .m3u8 request."
+    },
+    "example_video_site": {
+      "label": "Example public video site",
+      "search_url": "https://videos.example.org/search?q={query}",
+      "requires_login": false,
+      "capture": "page_url",
+      "skip_if_captions": true,
+      "skip_hosts": [],
+      "instructions": "The video page link can be passed to yt-dlp directly as media_url."
+    }
+  }
+}
